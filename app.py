@@ -10,13 +10,11 @@ st.set_page_config(
 
 st.title("🍲 Kombito - Gestão Completa de Custos e Vendas")
 
-
 # Função para conectar ao Turso usando os segredos
 def get_turso_client():
   url = st.secrets["TURSO_DATABASE_URL"]
   token = st.secrets["TURSO_AUTH_TOKEN"]
   return libsql_client.create_client_sync(url=url, auth_token=token)
-
 
 # Inicializar todas as tabelas no banco de dados se não existirem
 try:
@@ -26,9 +24,18 @@ try:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL,
             unidade TEXT NOT NULL,
+            quantidade_embalagem REAL NOT NULL DEFAULT 1.0,
+            preco_total REAL NOT NULL DEFAULT 0.0,
             preco_unitario REAL NOT NULL
         )
     """)
+  # Atualiza banco antigo caso não tenha as colunas de embalagem
+  try:
+    client.execute("ALTER TABLE insumos ADD COLUMN quantidade_embalagem REAL DEFAULT 1.0")
+    client.execute("ALTER TABLE insumos ADD COLUMN preco_total REAL DEFAULT 0.0")
+  except Exception:
+    pass
+
   client.execute("""
         CREATE TABLE IF NOT EXISTS marmitas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,17 +78,24 @@ aba1, aba2, aba3, aba4 = st.tabs([
 # ==========================================
 with aba1:
   st.header("Cadastro de Insumos e Embalagens")
-  st.write("Cadastre os ingredientes e embalagens comprados.")
+  st.write("Cadastre o pacote fechado (ex: Saco de Arroz 5kg, Azeite 500ml).")
 
   with st.form("form_insumo", clear_on_submit=True):
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     with col1:
-      nome_insumo = st.text_input("Nome do Item (ex: Arroz Agulinha)")
+      nome_insumo = st.text_input("Nome do Item (ex: Arroz Agulinha 5kg)")
     with col2:
       unidade = st.selectbox("Unidade de Compra", ["kg", "g", "litro", "ml", "un"])
     with col3:
-      preco = st.number_input(
-          "Preço Pago (R$)", min_value=0.0, format="%.2f", step=0.10
+      qtde_embalagem = st.number_input(
+          "Qtd/Peso da Embalagem (ex: 5 para 5kg)",
+          min_value=0.01,
+          value=1.0,
+          format="%.2f",
+      )
+    with col4:
+      preco_total = st.number_input(
+          "Preço Total Pago (R$)", min_value=0.0, format="%.2f", step=1.0
       )
 
     enviado_insumo = st.form_submit_button("Salvar Insumo")
@@ -91,10 +105,20 @@ with aba1:
         st.warning("Por favor, digite o nome do insumo.")
       else:
         try:
+          # Preço unitário base (por kg, por grama, por litro, etc)
+          preco_unitario = (
+              preco_total / qtde_embalagem if qtde_embalagem > 0 else 0.0
+          )
           client = get_turso_client()
           client.execute(
-              "INSERT INTO insumos (nome, unidade, preco_unitario) VALUES (?, ?, ?)",
-              [nome_insumo.strip(), unidade, preco],
+              "INSERT INTO insumos (nome, unidade, quantidade_embalagem, preco_total, preco_unitario) VALUES (?, ?, ?, ?, ?)",
+              [
+                  nome_insumo.strip(),
+                  unidade,
+                  float(qtde_embalagem),
+                  float(preco_total),
+                  float(preco_unitario),
+              ],
           )
           client.close()
           st.success(f"Insumo '{nome_insumo}' salvo com sucesso!")
@@ -106,7 +130,9 @@ with aba1:
   st.subheader("📋 Insumos Cadastrados")
   try:
     client = get_turso_client()
-    rs = client.execute("SELECT id, nome, unidade, preco_unitario FROM insumos")
+    rs = client.execute(
+        "SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos"
+    )
     client.close()
     if rs.rows:
       df_insumos = pd.DataFrame(
@@ -115,7 +141,9 @@ with aba1:
                   "ID": r[0],
                   "Item": r[1],
                   "Unidade": r[2],
-                  "Preço (R$)": r[3],
+                  "Tamanho Emb.": r[3],
+                  "Valor Pago (R$)": r[4],
+                  "Custo Base (R$)": r[5],
               }
               for r in rs.rows
           ]
@@ -177,17 +205,21 @@ with aba2:
     client = get_turso_client()
     res_marmitas = client.execute("SELECT id, nome FROM marmitas")
     res_insumos = client.execute(
-        "SELECT id, nome, unidade, preco_unitario FROM insumos"
+        "SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos"
     )
     client.close()
 
     marmitas_dict = {row[1]: row[0] for row in res_marmitas.rows}
     insumos_info = {
-        row[0]: {"nome": row[1], "unidade": row[2], "preco": row[3]}
+        row[0]: {
+            "nome": row[1],
+            "unidade": row[2],
+            "qtde_emb": row[3],
+        }
         for row in res_insumos.rows
     }
     insumos_dict = {
-        f"{row[1]} (Comprado em {row[2]} a R$ {row[3]:.2f})": row[0]
+        f"{row[1]} (Emb. de {row[3]} {row[2]} por R$ {row[4]:.2f})": row[0]
         for row in res_insumos.rows
     }
 
@@ -196,51 +228,58 @@ with aba2:
     elif not insumos_dict:
       st.info("Cadastre insumos na aba 'Insumos' antes de montar a receita.")
     else:
-      with st.form("form_ficha", clear_on_submit=True):
-        marmita_escolhida = st.selectbox(
-            "Selecione a Marmita", list(marmitas_dict.keys())
-        )
-        insumo_escolhido_str = st.selectbox(
-            "Selecione o Insumo/Embalagem", list(insumos_dict.keys())
-        )
+      # REMOVEMOS O FORMULÁRIO AQUI PARA AS UNIDADES ATUALIZAREM AO VIVO
+      marmita_escolhida = st.selectbox(
+          "Selecione a Marmita", list(marmitas_dict.keys())
+      )
+      insumo_escolhido_str = st.selectbox(
+          "Selecione o Insumo/Embalagem", list(insumos_dict.keys())
+      )
 
-        i_id = insumos_dict[insumo_escolhido_str]
-        unidade_compra = insumos_info[i_id]["unidade"].lower()
+      i_id = insumos_dict[insumo_escolhido_str]
+      unidade_compra = insumos_info[i_id]["unidade"].lower()
 
-        if unidade_compra == "kg":
-          label_qtd = "Quantidade utilizada (em gramas, ex: 150 para 150g)"
-          val_padrao = 150.0
-        elif unidade_compra == "litro":
-          label_qtd = "Quantidade utilizada (em ml, ex: 100 para 100ml)"
-          val_padrao = 100.0
-        else:
-          label_qtd = "Quantidade utilizada (unidades, ex: 1 para 1 pote)"
-          val_padrao = 1.0
-
-        quantidade_informada = st.number_input(
-            label_qtd, min_value=0.01, value=val_padrao, step=1.0
-        )
-
-        salvar_ficha = st.form_submit_button("Adicionar à Receita")
-
-        if salvar_ficha:
-          m_id = marmitas_dict[marmita_escolhida]
-          if unidade_compra in ["kg", "litro"]:
-            quantidade_salvar = quantidade_informada / 1000.0
+      col_qtd1, col_qtd2 = st.columns(2)
+      with col_qtd1:
+          quantidade_informada = st.number_input("Quantidade usada na marmita", min_value=0.01, value=1.0, step=1.0)
+      with col_qtd2:
+          # Mostra as opções corretas baseadas no que foi comprado
+          if unidade_compra in ["kg", "g"]:
+              opcoes_uso = ["g", "kg"]
+          elif unidade_compra in ["litro", "ml"]:
+              opcoes_uso = ["ml", "litro"]
           else:
-            quantidade_salvar = quantidade_informada
+              opcoes_uso = ["un"]
+          
+          unidade_uso = st.selectbox("Unidade de medida que você usou", opcoes_uso)
 
-          try:
-            client = get_turso_client()
-            client.execute(
-                "INSERT INTO ficha_tecnica (marmita_id, insumo_id, quantidade) VALUES (?, ?, ?)",
-                [m_id, i_id, quantidade_salvar],
-            )
-            client.close()
-            st.success("Ingrediente adicionado à receita com sucesso!")
-            st.rerun()
-          except Exception as e:
-            st.error(f"Erro ao salvar ficha técnica: {e}")
+      salvar_ficha = st.button("Adicionar à Receita", type="primary")
+
+      if salvar_ficha:
+        m_id = marmitas_dict[marmita_escolhida]
+        qtd_salvar = float(quantidade_informada)
+        
+        # Conversão invisível para bater com a unidade de compra no financeiro
+        if unidade_compra == "kg" and unidade_uso == "g":
+            qtd_salvar = quantidade_informada / 1000.0
+        elif unidade_compra == "g" and unidade_uso == "kg":
+            qtd_salvar = quantidade_informada * 1000.0
+        elif unidade_compra == "litro" and unidade_uso == "ml":
+            qtd_salvar = quantidade_informada / 1000.0
+        elif unidade_compra == "ml" and unidade_uso == "litro":
+            qtd_salvar = quantidade_informada * 1000.0
+
+        try:
+          client = get_turso_client()
+          client.execute(
+              "INSERT INTO ficha_tecnica (marmita_id, insumo_id, quantidade) VALUES (?, ?, ?)",
+              [m_id, i_id, qtd_salvar],
+          )
+          client.close()
+          st.success("Ingrediente adicionado à receita com sucesso!")
+          st.rerun()
+        except Exception as e:
+          st.error(f"Erro ao salvar ficha técnica: {e}")
 
       st.divider()
       st.subheader("🗑️ Gerenciar Marmitas e Receitas")
@@ -290,11 +329,11 @@ with aba3:
     df_i = (
         pd.DataFrame(
             [
-                dict(zip(["id", "nome", "unidade", "preco"], r))
-                for r in client.execute("SELECT * FROM insumos").rows
+                dict(zip(["id", "nome", "unidade", "qtde_emb", "preco_tot", "preco"], r))
+                for r in client.execute("SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos").rows
             ]
         )
-        if client.execute("SELECT * FROM insumos").rows
+        if client.execute("SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos").rows
         else pd.DataFrame()
     )
     df_ft = (
@@ -337,8 +376,7 @@ with aba3:
       st.dataframe(custos_por_marmita, use_container_width=True, hide_index=True)
     else:
       st.info(
-          "Cadastre marmitas e insumos nas fichas técnicas para ver os"
-          " custos."
+          "Cadastre marmitas e insumos nas fichas técnicas para ver os custos."
       )
   except Exception as e:
     st.error(f"Erro ao calcular custos: {e}")
@@ -349,8 +387,7 @@ with aba3:
 with aba4:
   st.header("📈 Controle de Vendas e Financeiro")
   st.write(
-      "Registre as vendas feitas, acompanhe o faturamento e o lucro real do"
-      " Kombito."
+      "Registre as vendas feitas, acompanhe o faturamento e o lucro real do Kombito."
   )
 
   try:
@@ -366,8 +403,7 @@ with aba4:
 
     if df_m_vendas.empty:
       st.warning(
-          "Você precisa cadastrar ao menos uma marmita antes de registrar"
-          " vendas."
+          "Você precisa cadastrar ao menos uma marmita antes de registrar vendas."
       )
     else:
       with st.form("form_venda", clear_on_submit=True):
@@ -453,8 +489,8 @@ with aba4:
         )
         df_i = pd.DataFrame(
             [
-                dict(zip(["id", "nome", "unidade", "preco"], r))
-                for r in client.execute("SELECT * FROM insumos").rows
+                dict(zip(["id", "nome", "unidade", "qtde_emb", "preco_tot", "preco"], r))
+                for r in client.execute("SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos").rows
             ]
         )
         df_ft = pd.DataFrame(
@@ -589,8 +625,7 @@ with aba4:
 
       else:
         st.info(
-            "Nenhuma venda registrada ainda. Use o formulário acima para"
-            " registrar a primeira venda!"
+            "Nenhuma venda registrada ainda. Use o formulário acima para registrar a primeira venda!"
         )
 
   except Exception as e:
