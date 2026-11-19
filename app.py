@@ -1,4 +1,6 @@
 import datetime
+import logging
+import math
 import libsql_client
 import pandas as pd
 import plotly.express as px
@@ -16,54 +18,148 @@ def get_turso_client():
   token = st.secrets["TURSO_AUTH_TOKEN"]
   return libsql_client.create_client_sync(url=url, auth_token=token)
 
-# Inicializar todas as tabelas no banco de dados se não existirem
-try:
-  client = get_turso_client()
-  client.execute("""
-        CREATE TABLE IF NOT EXISTS insumos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT NOT NULL,
-            unidade TEXT NOT NULL,
-            quantidade_embalagem REAL NOT NULL DEFAULT 1.0,
-            preco_total REAL NOT NULL DEFAULT 0.0,
-            preco_unitario REAL NOT NULL
-        )
-    """)
-  # Atualiza banco antigo caso não tenha as colunas de embalagem
-  try:
-    client.execute("ALTER TABLE insumos ADD COLUMN quantidade_embalagem REAL DEFAULT 1.0")
-    client.execute("ALTER TABLE insumos ADD COLUMN preco_total REAL DEFAULT 0.0")
-  except Exception:
-    pass
 
-  client.execute("""
-        CREATE TABLE IF NOT EXISTS marmitas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT NOT NULL
-        )
-    """)
-  client.execute("""
-        CREATE TABLE IF NOT EXISTS ficha_tecnica (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            marmita_id INTEGER NOT NULL,
-            insumo_id INTEGER NOT NULL,
-            quantidade REAL NOT NULL
-        )
-    """)
-  client.execute("""
-        CREATE TABLE IF NOT EXISTS vendas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data TEXT NOT NULL,
-            marmita_id INTEGER NOT NULL,
-            quantidade INTEGER NOT NULL,
-            valor_unitario REAL NOT NULL,
-            valor_total REAL NOT NULL,
-            cliente TEXT
-        )
-    """)
-  client.close()
-except Exception as e:
-  st.error(f"Erro ao inicializar o banco de dados: {e}")
+UNIDADES = {
+    "kg": ("massa", 1000),
+    "g": ("massa", 1),
+    "mg": ("massa", 0.001),
+    "litro": ("volume", 1000),
+    "ml": ("volume", 1),
+    "cl": ("volume", 10),
+    "dl": ("volume", 100),
+    "xícara (240 ml)": ("volume", 240),
+    "colher de sopa (15 ml)": ("volume", 15),
+    "colher de chá (5 ml)": ("volume", 5),
+    "un": ("contagem", 1),
+    "dúzia": ("contagem", 12),
+    "meia dúzia": ("contagem", 6),
+}
+
+CONSULTA_CUSTOS = """
+    SELECT f.marmita_id, SUM(f.quantidade * i.preco_unitario) AS custo
+    FROM ficha_tecnica AS f
+    LEFT JOIN insumos AS i ON i.id = f.insumo_id
+    GROUP BY f.marmita_id
+    HAVING COUNT(*) = COUNT(i.id)
+"""
+
+
+def executar(sql, parametros=()):
+  with get_turso_client() as client:
+    return client.execute(sql, parametros)
+
+
+def migrar_banco(client):
+  client.batch([
+      """CREATE TABLE IF NOT EXISTS insumos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL,
+          unidade TEXT NOT NULL, quantidade_embalagem REAL NOT NULL DEFAULT 1.0,
+          preco_total REAL NOT NULL DEFAULT 0.0, preco_unitario REAL NOT NULL
+      )""",
+      """CREATE TABLE IF NOT EXISTS marmitas (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL
+      )""",
+      """CREATE TABLE IF NOT EXISTS ficha_tecnica (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, marmita_id INTEGER NOT NULL,
+          insumo_id INTEGER NOT NULL, quantidade REAL NOT NULL
+      )""",
+      """CREATE TABLE IF NOT EXISTS vendas (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL,
+          marmita_id INTEGER NOT NULL, quantidade INTEGER NOT NULL,
+          valor_unitario REAL NOT NULL, valor_total REAL NOT NULL, cliente TEXT
+      )""",
+      """CREATE TABLE IF NOT EXISTS kombito_migracoes (
+          versao INTEGER PRIMARY KEY
+      )""",
+  ])
+  if client.execute("SELECT 1 FROM kombito_migracoes WHERE versao = 1").rows:
+    return
+
+  alteracoes = []
+  for tabela, campos in {
+      "insumos": {
+          "quantidade_embalagem": "REAL NOT NULL DEFAULT 1.0",
+          "preco_total": "REAL NOT NULL DEFAULT 0.0",
+      },
+      "vendas": {
+          "marmita_nome": "TEXT",
+          "custo_unitario": "REAL",
+          "custo_estimado": "INTEGER NOT NULL DEFAULT 0",
+      },
+  }.items():
+    existentes = {r[1] for r in client.execute(f"PRAGMA table_info({tabela})").rows}
+    for coluna, tipo in campos.items():
+      if coluna not in existentes:
+        alteracoes.append(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {tipo}")
+        if coluna == "preco_total":
+          alteracoes.append("UPDATE insumos SET preco_total = preco_unitario * quantidade_embalagem")
+
+  client.batch([
+      *alteracoes,
+      "CREATE INDEX IF NOT EXISTS ficha_insumo_idx ON ficha_tecnica(insumo_id)",
+      "CREATE INDEX IF NOT EXISTS ficha_marmita_idx ON ficha_tecnica(marmita_id)",
+      f"""WITH custos AS ({CONSULTA_CUSTOS})
+          UPDATE vendas SET
+            marmita_nome = COALESCE(
+              (SELECT nome FROM marmitas WHERE id = vendas.marmita_id),
+              'Marmita excluída #' || marmita_id
+            ),
+            custo_unitario = (SELECT custo FROM custos WHERE marmita_id = vendas.marmita_id),
+            custo_estimado = 1
+          WHERE marmita_nome IS NULL""",
+      """CREATE TRIGGER IF NOT EXISTS kombito_proteger_insumo
+          BEFORE DELETE ON insumos
+          WHEN EXISTS (SELECT 1 FROM ficha_tecnica WHERE insumo_id = OLD.id)
+          BEGIN
+            SELECT RAISE(ABORT, 'INSUMO_EM_USO');
+          END""",
+      """CREATE TRIGGER IF NOT EXISTS kombito_validar_ficha
+          BEFORE INSERT ON ficha_tecnica
+          WHEN NOT EXISTS (SELECT 1 FROM insumos WHERE id = NEW.insumo_id)
+            OR NOT EXISTS (SELECT 1 FROM marmitas WHERE id = NEW.marmita_id)
+          BEGIN
+            SELECT RAISE(ABORT, 'INSUMO_OU_MARMITA_INDISPONIVEL');
+          END""",
+      """CREATE TRIGGER IF NOT EXISTS kombito_excluir_ficha
+          AFTER DELETE ON marmitas
+          BEGIN
+            DELETE FROM ficha_tecnica WHERE marmita_id = OLD.id;
+          END""",
+      "INSERT OR IGNORE INTO kombito_migracoes (versao) VALUES (1)",
+  ])
+
+
+@st.cache_resource
+def inicializar_banco(url, _token):
+  with libsql_client.create_client_sync(url=url, auth_token=_token) as client:
+    try:
+      migrar_banco(client)
+    except libsql_client.LibsqlError:
+      # Outra sessão pode ter concluído a migração enquanto esta lia o esquema.
+      if not client.execute("SELECT 1 FROM kombito_migracoes WHERE versao = 1").rows:
+        raise
+      logging.info("Migração do Kombito concluída por outra sessão.")
+  return True
+
+
+def apagar(sql, registro_id, sucesso):
+  resultado = executar(sql, [registro_id])
+  if resultado.rows_affected != 1:
+    st.warning("O registro já foi removido. Atualize a página.")
+    return
+  st.session_state["mensagem_sucesso"] = sucesso
+  st.rerun()
+
+
+try:
+  inicializar_banco(st.secrets["TURSO_DATABASE_URL"], st.secrets["TURSO_AUTH_TOKEN"])
+except Exception:
+  logging.exception("Falha ao preparar ou migrar o banco do Kombito")
+  st.error("Não foi possível preparar o banco. Verifique a conexão com o Turso e consulte o log do aplicativo antes de tentar novamente.")
+  st.stop()
+
+if mensagem := st.session_state.pop("mensagem_sucesso", None):
+  st.success(mensagem)
 
 # Criando as Abas do Sistema
 aba1, aba2, aba3, aba4 = st.tabs([
@@ -85,7 +181,7 @@ with aba1:
     with col1:
       nome_insumo = st.text_input("Nome do Item (ex: Arroz Agulinha 5kg)")
     with col2:
-      unidade = st.selectbox("Unidade de Compra", ["kg", "g", "litro", "ml", "un"])
+      unidade = st.selectbox("Unidade de Compra", list(UNIDADES))
     with col3:
       qtde_embalagem = st.number_input(
           "Qtd/Peso da Embalagem (ex: 5 para 5kg)",
@@ -103,14 +199,15 @@ with aba1:
     if enviado_insumo:
       if nome_insumo.strip() == "":
         st.warning("Por favor, digite o nome do insumo.")
+      elif not (math.isfinite(qtde_embalagem) and qtde_embalagem > 0
+                and math.isfinite(preco_total) and preco_total >= 0
+                and math.isfinite(preco_total / qtde_embalagem)):
+        st.warning("Informe uma quantidade positiva e um preço válido.")
       else:
         try:
           # Preço unitário base (por kg, por grama, por litro, etc)
-          preco_unitario = (
-              preco_total / qtde_embalagem if qtde_embalagem > 0 else 0.0
-          )
-          client = get_turso_client()
-          client.execute(
+          preco_unitario = preco_total / qtde_embalagem
+          executar(
               "INSERT INTO insumos (nome, unidade, quantidade_embalagem, preco_total, preco_unitario) VALUES (?, ?, ?, ?, ?)",
               [
                   nome_insumo.strip(),
@@ -120,7 +217,6 @@ with aba1:
                   float(preco_unitario),
               ],
           )
-          client.close()
           st.success(f"Insumo '{nome_insumo}' salvo com sucesso!")
           st.rerun()
         except Exception as e:
@@ -129,11 +225,9 @@ with aba1:
   st.divider()
   st.subheader("📋 Insumos Cadastrados")
   try:
-    client = get_turso_client()
-    rs = client.execute(
+    rs = executar(
         "SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos"
     )
-    client.close()
     if rs.rows:
       df_insumos = pd.DataFrame(
           [
@@ -148,24 +242,28 @@ with aba1:
               for r in rs.rows
           ]
       )
-      st.dataframe(df_insumos, use_container_width=True, hide_index=True)
+      st.dataframe(df_insumos, width="stretch", hide_index=True)
 
       st.write("---")
       st.subheader("🗑️ Excluir Insumo")
-      insumos_dict = {f"{row[1]} (ID: {row[0]})": row[0] for row in rs.rows}
+      nomes_insumos = {r[0]: f"{r[1]} (ID {r[0]})" for r in rs.rows}
       insumo_para_excluir = st.selectbox(
-          "Selecione o insumo para apagar", list(insumos_dict.keys())
+          "Selecione o insumo para apagar", list(nomes_insumos),
+          format_func=nomes_insumos.__getitem__, key="insumo_excluir",
       )
-      if st.button("Excluir Insumo Selecionado", type="primary"):
-        id_del = insumos_dict[insumo_para_excluir]
+      em_uso = executar(
+          "SELECT 1 FROM ficha_tecnica WHERE insumo_id = ? LIMIT 1", [insumo_para_excluir]
+      ).rows
+      if em_uso:
+        st.warning("Este insumo está em uma ficha técnica. Remova-o da receita antes de excluí-lo.")
+      elif st.button("Excluir Insumo Selecionado", type="primary"):
         try:
-          client = get_turso_client()
-          client.execute("DELETE FROM insumos WHERE id = ?", [id_del])
-          client.close()
-          st.success("Insumo excluído com sucesso!")
-          st.rerun()
-        except Exception as e:
-          st.error(f"Erro ao excluir insumo: {e}")
+          apagar("DELETE FROM insumos WHERE id = ?", insumo_para_excluir, "Insumo excluído.")
+        except libsql_client.LibsqlError as exc:
+          if "INSUMO_EM_USO" in str(exc):
+            st.warning("Este insumo passou a ser usado em uma ficha técnica.")
+          else:
+            raise
     else:
       st.info("Nenhum insumo cadastrado ainda.")
   except Exception as e:
@@ -178,208 +276,139 @@ with aba2:
   st.header("Montagem de Marmitas e Receitas")
 
   with st.form("form_marmita", clear_on_submit=True):
-    nome_marmita = st.text_input(
-        "Nome do Prato/Marmita (ex: Frango Grelhado com Legumes)"
-    )
-    salvar_marmita = st.form_submit_button("Criar Nova Marmita")
-
-    if salvar_marmita:
-      if nome_marmita.strip() == "":
+    nome_marmita = st.text_input("Nome do Prato/Marmita (ex: Frango Grelhado com Legumes)")
+    if st.form_submit_button("Criar Nova Marmita"):
+      if not nome_marmita.strip():
         st.warning("Digite o nome da marmita.")
       else:
         try:
-          client = get_turso_client()
-          client.execute(
-              "INSERT INTO marmitas (nome) VALUES (?)", [nome_marmita.strip()]
-          )
-          client.close()
-          st.success(f"Marmita '{nome_marmita}' criada com sucesso!")
+          executar("INSERT INTO marmitas (nome) VALUES (?)", [nome_marmita.strip()])
+          st.session_state["mensagem_sucesso"] = "Marmita criada."
           st.rerun()
-        except Exception as e:
-          st.error(f"Erro ao criar marmita: {e}")
+        except Exception as exc:
+          st.error(f"Erro ao criar marmita: {exc}")
 
   st.divider()
   st.subheader("Adicionar Ingrediente à Ficha Técnica")
-
   try:
-    client = get_turso_client()
-    res_marmitas = client.execute("SELECT id, nome FROM marmitas")
-    res_insumos = client.execute(
-        "SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos"
-    )
-    client.close()
-
-    marmitas_dict = {row[1]: row[0] for row in res_marmitas.rows}
-    insumos_info = {
-        row[0]: {
-            "nome": row[1],
-            "unidade": row[2],
-            "qtde_emb": row[3],
-        }
-        for row in res_insumos.rows
+    marmitas = {
+        r[0]: f"{r[1]} (ID {r[0]})"
+        for r in executar("SELECT id, nome FROM marmitas ORDER BY nome, id").rows
     }
-    insumos_dict = {
-        f"{row[1]} (Emb. de {row[3]} {row[2]} por R$ {row[4]:.2f})": row[0]
-        for row in res_insumos.rows
+    insumos = {
+        r[0]: r for r in executar(
+            "SELECT id, nome, unidade, quantidade_embalagem, preco_total FROM insumos ORDER BY nome, id"
+        ).rows
+    }
+    rotulos_insumos = {
+        id_insumo: f"{r[1]} ({r[3]:g} {r[2]} por R$ {r[4]:.2f}, ID {id_insumo})"
+        for id_insumo, r in insumos.items()
     }
 
-    if not marmitas_dict:
-      st.info("Cadastre pelo menos uma marmita acima para montar a receita.")
-    elif not insumos_dict:
-      st.info("Cadastre insumos na aba 'Insumos' antes de montar a receita.")
+    if not marmitas:
+      st.info("Cadastre uma marmita para montar a receita.")
     else:
-      # REMOVEMOS O FORMULÁRIO AQUI PARA AS UNIDADES ATUALIZAREM AO VIVO
-      marmita_escolhida = st.selectbox(
-          "Selecione a Marmita", list(marmitas_dict.keys())
+      marmita_id = st.selectbox(
+          "Selecione a Marmita", list(marmitas), format_func=marmitas.__getitem__, key="receita_marmita",
       )
-      insumo_escolhido_str = st.selectbox(
-          "Selecione o Insumo/Embalagem", list(insumos_dict.keys())
-      )
+      if not insumos:
+        st.info("Cadastre insumos na aba Insumos para montar a receita.")
+      else:
+        insumo_id = st.selectbox(
+            "Selecione o Insumo/Embalagem", list(insumos),
+            format_func=rotulos_insumos.__getitem__, key="receita_insumo",
+        )
+        unidade_compra = insumos[insumo_id][2].strip().lower()
+        grupo, fator_compra = UNIDADES.get(unidade_compra, (unidade_compra, 1))
+        opcoes = [unidade for unidade, (tipo, _) in UNIDADES.items() if tipo == grupo]
+        if not opcoes:
+          opcoes = [unidade_compra]
+        elif grupo in ("massa", "volume"):
+          # Começa pela unidade menor que já era usada como padrão na receita.
+          padrao = {"massa": "g", "volume": "ml"}[grupo]
+          opcoes.remove(padrao)
+          opcoes.insert(0, padrao)
 
-      i_id = insumos_dict[insumo_escolhido_str]
-      unidade_compra = insumos_info[i_id]["unidade"].lower()
-
-      col_qtd1, col_qtd2 = st.columns(2)
-      with col_qtd1:
-          quantidade_informada = st.number_input("Quantidade usada na marmita", min_value=0.01, value=1.0, step=1.0)
-      with col_qtd2:
-          # Mostra as opções corretas baseadas no que foi comprado
-          if unidade_compra in ["kg", "g"]:
-              opcoes_uso = ["g", "kg"]
-          elif unidade_compra in ["litro", "ml"]:
-              opcoes_uso = ["ml", "litro"]
-          else:
-              opcoes_uso = ["un"]
-          
-          unidade_uso = st.selectbox("Unidade de medida que você usou", opcoes_uso)
-
-      salvar_ficha = st.button("Adicionar à Receita", type="primary")
-
-      if salvar_ficha:
-        m_id = marmitas_dict[marmita_escolhida]
-        qtd_salvar = float(quantidade_informada)
-        
-        # Conversão invisível para bater com a unidade de compra no financeiro
-        if unidade_compra == "kg" and unidade_uso == "g":
-            qtd_salvar = quantidade_informada / 1000.0
-        elif unidade_compra == "g" and unidade_uso == "kg":
-            qtd_salvar = quantidade_informada * 1000.0
-        elif unidade_compra == "litro" and unidade_uso == "ml":
-            qtd_salvar = quantidade_informada / 1000.0
-        elif unidade_compra == "ml" and unidade_uso == "litro":
-            qtd_salvar = quantidade_informada * 1000.0
-
-        try:
-          client = get_turso_client()
-          client.execute(
-              "INSERT INTO ficha_tecnica (marmita_id, insumo_id, quantidade) VALUES (?, ?, ?)",
-              [m_id, i_id, qtd_salvar],
+        col_qtd, col_unidade = st.columns(2)
+        with col_qtd:
+          quantidade = st.number_input(
+              "Quantidade usada na marmita", min_value=0.001, value=1.0,
+              step=0.001, format="%.3f",
           )
-          client.close()
-          st.success("Ingrediente adicionado à receita com sucesso!")
-          st.rerun()
-        except Exception as e:
-          st.error(f"Erro ao salvar ficha técnica: {e}")
+        with col_unidade:
+          unidade_uso = st.selectbox(
+              "Unidade de medida que você usou", opcoes, key=f"receita_unidade_{grupo}",
+          )
+        if st.button("Adicionar à Receita", type="primary"):
+          _, fator_uso = UNIDADES.get(unidade_uso, (grupo, 1))
+          quantidade_base = quantidade * (fator_uso / fator_compra)
+          if not math.isfinite(quantidade_base) or quantidade_base <= 0:
+            st.warning("Informe uma quantidade positiva e válida.")
+          else:
+            executar(
+                "INSERT INTO ficha_tecnica (marmita_id, insumo_id, quantidade) VALUES (?, ?, ?)",
+                [marmita_id, insumo_id, quantidade_base],
+            )
+            st.session_state["mensagem_sucesso"] = "Ingrediente adicionado à receita."
+            st.rerun()
+
+      ficha = executar(
+          """SELECT f.id, COALESCE(i.nome, 'Insumo removido #' || f.insumo_id),
+                    f.quantidade, i.unidade
+             FROM ficha_tecnica AS f LEFT JOIN insumos AS i ON i.id = f.insumo_id
+             WHERE f.marmita_id = ? ORDER BY f.id""",
+          [marmita_id],
+      ).rows
+      st.subheader("Ficha técnica")
+      if ficha:
+        st.dataframe(pd.DataFrame(
+            [tuple(r) for r in ficha], columns=["ID", "Insumo", "Quantidade na unidade de compra", "Unidade"],
+        ), hide_index=True, width="stretch")
+        itens = {r[0]: f"{r[1]} (item {r[0]})" for r in ficha}
+        item_id = st.selectbox("Ingrediente a remover", list(itens), format_func=itens.__getitem__)
+        confirmar_item = st.checkbox("Confirmo a remoção deste ingrediente", key=f"confirma_item_{item_id}")
+        if st.button("Remover ingrediente", disabled=not confirmar_item):
+          apagar("DELETE FROM ficha_tecnica WHERE id = ?", item_id, "Ingrediente removido da receita.")
+      else:
+        st.info("A ficha técnica está vazia.")
 
       st.divider()
-      st.subheader("🗑️ Gerenciar Marmitas e Receitas")
-      marmita_del = st.selectbox(
-          "Selecione a marmita para excluir (remove ela e sua ficha técnica)",
-          list(marmitas_dict.keys()),
+      st.subheader("Excluir marmita")
+      st.write("A exclusão remove a ficha técnica da marmita e mantém as vendas registradas.")
+      confirmar_marmita = st.checkbox(
+          f"Confirmo a exclusão de {marmitas[marmita_id]}", key=f"confirma_marmita_{marmita_id}",
       )
-      if st.button("Excluir Marmita", type="primary"):
-        m_id_del = marmitas_dict[marmita_del]
-        try:
-          client = get_turso_client()
-          client.execute(
-              "DELETE FROM ficha_tecnica WHERE marmita_id = ?", [m_id_del]
-          )
-          client.execute("DELETE FROM marmitas WHERE id = ?", [m_id_del])
-          client.close()
-          st.success("Marmita excluída com sucesso!")
-          st.rerun()
-        except Exception as e:
-          st.error(f"Erro ao excluir marmita: {e}")
+      if st.button("Excluir Marmita", type="primary", disabled=not confirmar_marmita):
+        apagar("DELETE FROM marmitas WHERE id = ?", marmita_id, "Marmita e ficha técnica excluídas.")
 
-  except Exception as e:
-    st.error(f"Erro ao carregar dados para receitas: {e}")
+  except Exception as exc:
+    st.error(f"Erro ao gerenciar receitas: {exc}")
 
 # ==========================================
 # ABA 3: CUSTOS E PRECIFICAÇÃO
 # ==========================================
 with aba3:
   st.header("Análise de Custos e Sugestão de Preço de Venda")
-  margem_lucro = st.slider(
-      "Margem de Lucro Desejada (%)",
-      min_value=10,
-      max_value=300,
-      value=100,
-      step=10,
-  )
-
+  acrescimo = st.slider("Acréscimo sobre o custo (%)", 10, 300, 100, step=10)
   try:
-    client = get_turso_client()
-    df_m = (
-        pd.DataFrame(
-            [dict(zip(["id", "nome"], r)) for r in client.execute("SELECT * FROM marmitas").rows]
-        )
-        if client.execute("SELECT * FROM marmitas").rows
-        else pd.DataFrame()
-    )
-    df_i = (
-        pd.DataFrame(
-            [
-                dict(zip(["id", "nome", "unidade", "qtde_emb", "preco_tot", "preco"], r))
-                for r in client.execute("SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos").rows
-            ]
-        )
-        if client.execute("SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos").rows
-        else pd.DataFrame()
-    )
-    df_ft = (
-        pd.DataFrame(
-            [
-                dict(zip(["id", "marmita_id", "insumo_id", "qtd"], r))
-                for r in client.execute("SELECT * FROM ficha_tecnica").rows
-            ]
-        )
-        if client.execute("SELECT * FROM ficha_tecnica").rows
-        else pd.DataFrame()
-    )
-    client.close()
-
-    if not df_m.empty and not df_ft.empty and not df_i.empty:
-      df_ft = df_ft.merge(
-          df_m, left_on="marmita_id", right_on="id", suffixes=('', '_m')
+    custos = executar(f"""
+        SELECT m.id, m.nome, c.custo FROM marmitas AS m
+        JOIN ({CONSULTA_CUSTOS}) AS c ON c.marmita_id = m.id
+        ORDER BY m.nome, m.id
+    """).rows
+    if custos:
+      tabela = pd.DataFrame(
+          [tuple(r) for r in custos], columns=["ID", "Marmita", "Custo de Produção (R$)"],
       )
-      df_ft = df_ft.merge(
-          df_i, left_on="insumo_id", right_on="id", suffixes=('', '_i')
-      )
-
-      df_ft["custo_item"] = df_ft["preco"] * df_ft["qtd"]
-
-      custos_por_marmita = (
-          df_ft.groupby("nome")["custo_item"].sum().reset_index()
-      )
-      custos_por_marmita.columns = ["Marmita", "Custo de Produção (R$)"]
-
-      custos_por_marmita["Preço de Venda Sugerido (R$)"] = custos_por_marmita[
-          "Custo de Produção (R$)"
-      ] * (1 + margem_lucro / 100)
-      custos_por_marmita["Lucro Estimado (R$)"] = (
-          custos_por_marmita["Preço de Venda Sugerido (R$)"]
-          - custos_por_marmita["Custo de Produção (R$)"]
-      )
-      custos_por_marmita = custos_por_marmita.round(2)
-
+      custo = tabela["Custo de Produção (R$)"]
+      tabela["Preço de Venda Sugerido (R$)"] = custo * (1 + acrescimo / 100)
+      tabela["Lucro Estimado (R$)"] = custo * acrescimo / 100
       st.subheader("📊 Custos e Sugestão de Preços")
-      st.dataframe(custos_por_marmita, use_container_width=True, hide_index=True)
+      st.dataframe(tabela.round(2), width="stretch", hide_index=True)
     else:
-      st.info(
-          "Cadastre marmitas e insumos nas fichas técnicas para ver os custos."
-      )
-  except Exception as e:
-    st.error(f"Erro ao calcular custos: {e}")
+      st.info("Cadastre marmitas e insumos nas fichas técnicas para ver os custos.")
+  except Exception as exc:
+    st.error(f"Erro ao calcular custos: {exc}")
 
 # ==========================================
 # ABA 4: VENDAS & FINANCEIRO
@@ -391,242 +420,151 @@ with aba4:
   )
 
   try:
-    client = get_turso_client()
-    df_m_vendas = (
-        pd.DataFrame(
-            [dict(zip(["id", "nome"], r)) for r in client.execute("SELECT * FROM marmitas").rows]
-        )
-        if client.execute("SELECT * FROM marmitas").rows
-        else pd.DataFrame()
-    )
-    client.close()
-
-    if df_m_vendas.empty:
-      st.warning(
-          "Você precisa cadastrar ao menos uma marmita antes de registrar vendas."
-      )
+    marmitas_venda = {
+        r[0]: f"{r[1]} (ID {r[0]})"
+        for r in executar("SELECT id, nome FROM marmitas ORDER BY nome, id").rows
+    }
+    if not marmitas_venda:
+      st.info("Cadastre uma marmita para registrar novas vendas.")
     else:
       with st.form("form_venda", clear_on_submit=True):
         st.subheader("Registrar Nova Venda")
         col_v1, col_v2, col_v3 = st.columns(3)
-
         with col_v1:
           data_venda = st.date_input("Data da Venda", datetime.date.today())
           marmita_vendida = st.selectbox(
-              "Marmita", df_m_vendas["nome"].tolist()
+              "Marmita", list(marmitas_venda), format_func=marmitas_venda.__getitem__,
+              key="venda_marmita",
           )
         with col_v2:
-          qtd_vendida = st.number_input(
-              "Quantidade", min_value=1, value=1, step=1
-          )
+          qtd_vendida = st.number_input("Quantidade", min_value=1, value=1, step=1)
           valor_un = st.number_input(
-              "Valor Unitário cobrado (R$)",
-              min_value=0.0,
-              value=20.0,
-              format="%.2f",
+              "Valor Unitário cobrado (R$)", min_value=0.0, value=20.0, format="%.2f",
           )
         with col_v3:
-          nome_cliente = st.text_input(
-              "Nome do Cliente (Opcional)", placeholder="Ex: João"
-          )
+          nome_cliente = st.text_input("Nome do Cliente (Opcional)", placeholder="Ex: João")
 
-        salvar_venda = st.form_submit_button("Registrar Venda")
-
-        if salvar_venda:
-          m_id = df_m_vendas[df_m_vendas["nome"] == marmita_vendida][
-              "id"
-          ].values[0]
-          v_total = qtd_vendida * valor_un
-          try:
-            client = get_turso_client()
-            client.execute(
-                "INSERT INTO vendas (data, marmita_id, quantidade, valor_unitario, valor_total, cliente) VALUES (?, ?, ?, ?, ?, ?)",
-                [
-                    str(data_venda),
-                    int(m_id),
-                    int(qtd_vendida),
-                    float(valor_un),
-                    float(v_total),
-                    nome_cliente.strip() if nome_cliente else "",
-                ],
+        if st.form_submit_button("Registrar Venda"):
+          total = qtd_vendida * valor_un
+          if not (isinstance(data_venda, datetime.date) and qtd_vendida >= 1
+                  and math.isfinite(valor_un) and valor_un >= 0 and math.isfinite(total)):
+            st.warning("Informe uma data, uma quantidade positiva e um preço válido.")
+          else:
+            resultado = executar(
+                f"""INSERT INTO vendas (
+                        data, marmita_id, quantidade, valor_unitario, valor_total,
+                        cliente, marmita_nome, custo_unitario
+                    )
+                    SELECT ?, m.id, ?, ?, ?, ?, m.nome, c.custo FROM marmitas AS m
+                    LEFT JOIN ({CONSULTA_CUSTOS}) AS c ON c.marmita_id = m.id
+                    WHERE m.id = ?""",
+                [data_venda.isoformat(), qtd_vendida, valor_un, total, nome_cliente.strip(), marmita_vendida],
             )
-            client.close()
-            st.success("Venda registrada com sucesso!")
-            st.rerun()
-          except Exception as e:
-            st.error(f"Erro ao registrar venda: {e}")
+            if resultado.rows_affected == 1:
+              st.session_state["mensagem_sucesso"] = "Venda registrada."
+              st.rerun()
+            st.warning("Esta marmita já foi excluída. Atualize a página.")
+
+    st.divider()
+    vendas = executar("""
+        SELECT id, data, marmita_id, quantidade, valor_unitario, valor_total, cliente,
+               COALESCE(marmita_nome, 'Marmita #' || marmita_id), custo_unitario, custo_estimado
+        FROM vendas ORDER BY data DESC, id DESC
+    """)
+    if vendas.rows:
+      df_vendas = pd.DataFrame([tuple(r) for r in vendas.rows], columns=[
+          "id", "data", "marmita_id", "quantidade", "valor_unitario",
+          "valor_total", "cliente", "nome", "custo_unitario", "custo_estimado",
+      ])
+      df_vendas["lucro_total"] = (
+          df_vendas["valor_total"] - pd.to_numeric(df_vendas["custo_unitario"]) * df_vendas["quantidade"]
+      )
+      df_vendas["marmita"] = (
+          df_vendas["nome"] + " (ID " + df_vendas["marmita_id"].astype(str) + ")"
+      )
+      df_vendas["origem_custo"] = "Registrado na venda"
+      df_vendas.loc[df_vendas["custo_estimado"].eq(1), "origem_custo"] = "Estimado na migração"
+      df_vendas.loc[df_vendas["custo_unitario"].isna(), "origem_custo"] = "Indisponível"
+
+      st.subheader("📊 Resumo Geral")
+      faturamento_total = df_vendas["valor_total"].sum()
+      lucro_liquido_total = df_vendas["lucro_total"].sum(min_count=1)
+      total_marmitas_vendidas = df_vendas["quantidade"].sum()
+      total_clientes = (
+          df_vendas["cliente"].replace("", pd.NA).dropna().nunique()
+      )
+
+      m1, m2, m3, m4 = st.columns(4)
+      m1.metric("Faturamento Total", f"R$ {faturamento_total:.2f}")
+      m2.metric(
+          "Lucro nas Vendas com Custo",
+          f"R$ {lucro_liquido_total:.2f}" if pd.notna(lucro_liquido_total) else "Indisponível",
+      )
+      if df_vendas["origem_custo"].ne("Registrado na venda").any():
+        st.caption("O lucro inclui custos estimados na migração e exclui vendas sem custo disponível.")
+      m3.metric("Marmitas Vendidas", int(total_marmitas_vendidas))
+      m4.metric("Clientes Únicos", int(total_clientes))
 
       st.divider()
 
-      client = get_turso_client()
-      res_v = client.execute("SELECT * FROM vendas")
-      client.close()
+      col_g1, col_g2 = st.columns(2)
 
-      if res_v.rows:
-        df_vendas = pd.DataFrame(
-            [
-                dict(
-                    zip(
-                        [
-                            "id",
-                            "data",
-                            "marmita_id",
-                            "quantidade",
-                            "valor_unitario",
-                            "valor_total",
-                            "cliente",
-                        ],
-                        r,
-                    )
-                )
-                for r in res_v.rows
-            ]
+      with col_g1:
+        st.subheader("📅 Vendas por Dia (Faturamento)")
+        vendas_por_dia = (
+            df_vendas.groupby("data")["valor_total"].sum().reset_index()
         )
-
-        client = get_turso_client()
-        df_m = pd.DataFrame(
-            [dict(zip(["id", "nome"], r)) for r in client.execute("SELECT * FROM marmitas").rows]
+        fig_dia = px.bar(
+            vendas_por_dia,
+            x="data",
+            y="valor_total",
+            labels={
+                "data": "Data",
+                "valor_total": "Faturamento (R$)",
+            },
+            color_discrete_sequence=["#FF4B4B"],
         )
-        df_i = pd.DataFrame(
-            [
-                dict(zip(["id", "nome", "unidade", "qtde_emb", "preco_tot", "preco"], r))
-                for r in client.execute("SELECT id, nome, unidade, quantidade_embalagem, preco_total, preco_unitario FROM insumos").rows
-            ]
+        st.plotly_chart(fig_dia, width="stretch")
+
+      with col_g2:
+        st.subheader("🍲 Marmitas Mais Vendidas (Quantidade)")
+        vendas_por_prato = (
+            df_vendas.groupby("marmita")["quantidade"].sum().reset_index()
         )
-        df_ft = pd.DataFrame(
-            [
-                dict(zip(["id", "marmita_id", "insumo_id", "qtd"], r))
-                for r in client.execute("SELECT * FROM ficha_tecnica").rows
-            ]
+        fig_prato = px.pie(
+            vendas_por_prato,
+            names="marmita",
+            values="quantidade",
+            hole=0.4,
         )
-        client.close()
+        st.plotly_chart(fig_prato, width="stretch")
 
-        if not df_ft.empty and not df_i.empty:
-          df_ft = df_ft.merge(df_m, left_on="marmita_id", right_on="id")
-          df_ft = df_ft.merge(df_i, left_on="insumo_id", right_on="id")
-          df_ft["custo_item"] = df_ft["preco"] * df_ft["qtd"]
-          custos_dict = (
-              df_ft.groupby("marmita_id")["custo_item"].sum().to_dict()
-          )
-        else:
-          custos_dict = {}
+      st.divider()
+      st.subheader("📋 Histórico Detalhado de Vendas e Exclusão")
 
-        df_vendas["custo_unitario"] = df_vendas["marmita_id"].map(
-            custos_dict
-        ).fillna(0.0)
-        df_vendas["custo_total"] = (
-            df_vendas["custo_unitario"] * df_vendas["quantidade"]
+      rotulos_vendas = {
+          r.id: f"Venda {r.id} | {r.data} | {r.marmita} ({r.quantidade} un)"
+          for r in df_vendas.itertuples()
+      }
+      col_tabela, col_exclusao = st.columns([2, 1])
+      with col_tabela:
+        tabela = df_vendas[[
+            "id", "data", "marmita", "quantidade", "valor_unitario",
+            "valor_total", "lucro_total", "origem_custo", "cliente",
+        ]].copy()
+        tabela.columns = [
+            "ID", "Data", "Marmita", "Qtd", "Preço Un. (R$)",
+            "Total (R$)", "Lucro (R$)", "Origem do custo", "Cliente",
+        ]
+        st.dataframe(tabela.round(2), width="stretch", hide_index=True)
+      with col_exclusao:
+        venda_id = st.selectbox(
+            "Selecione a venda", list(rotulos_vendas), format_func=rotulos_vendas.__getitem__,
         )
-        df_vendas["lucro_total"] = (
-            df_vendas["valor_total"] - df_vendas["custo_total"]
-        )
-        df_vendas = df_vendas.merge(
-            df_m, left_on="marmita_id", right_on="id", suffixes=('', '_m')
-        )
-
-        st.subheader("📊 Resumo Geral")
-        faturamento_total = df_vendas["valor_total"].sum()
-        lucro_liquido_total = df_vendas["lucro_total"].sum()
-        total_marmitas_vendidas = df_vendas["quantidade"].sum()
-        total_clientes = (
-            df_vendas["cliente"].replace("", pd.NA).dropna().nunique()
-        )
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Faturamento Total", f"R$ {faturamento_total:.2f}")
-        m2.metric("Lucro Líquido Real", f"R$ {lucro_liquido_total:.2f}")
-        m3.metric("Marmitas Vendidas", int(total_marmitas_vendidas))
-        m4.metric("Clientes Únicos", int(total_clientes))
-
-        st.divider()
-
-        col_g1, col_g2 = st.columns(2)
-
-        with col_g1:
-          st.subheader("📅 Vendas por Dia (Faturamento)")
-          vendas_por_dia = (
-              df_vendas.groupby("data")["valor_total"].sum().reset_index()
-          )
-          fig_dia = px.bar(
-              vendas_por_dia,
-              x="data",
-              y="valor_total",
-              labels={
-                  "data": "Data",
-                  "valor_total": "Faturamento (R$)",
-              },
-              color_discrete_sequence=["#FF4B4B"],
-          )
-          st.plotly_chart(fig_dia, use_container_width=True)
-
-        with col_g2:
-          st.subheader("🍲 Marmitas Mais Vendidas (Quantidade)")
-          vendas_por_prato = (
-              df_vendas.groupby("nome")["quantidade"].sum().reset_index()
-          )
-          fig_prato = px.pie(
-              vendas_por_prato,
-              names="nome",
-              values="quantidade",
-              hole=0.4,
-          )
-          st.plotly_chart(fig_prato, use_container_width=True)
-
-        st.divider()
-        st.subheader("📋 Histórico Detalhado de Vendas e Exclusão")
-
-        vendas_dict = {
-            f"ID {r['id']} | Data: {r['data']} | {r['nome']} ({r['quantidade']} un)": r[
-                'id'
-            ]
-            for _, r in df_vendas.iterrows()
-        }
-
-        col_ex_v1, col_ex_v2 = st.columns([2, 1])
-        with col_ex_v1:
-          tabela_exibicao = df_vendas[[
-              "id",
-              "data",
-              "nome",
-              "quantidade",
-              "valor_unitario",
-              "valor_total",
-              "lucro_total",
-              "cliente",
-          ]]
-          tabela_exibicao.columns = [
-              "ID",
-              "Data",
-              "Marmita",
-              "Qtd",
-              "Preço Un. (R$)",
-              "Total (R$)",
-              "Lucro (R$)",
-              "Cliente",
-          ]
-          tabela_exibicao = tabela_exibicao.round(2)
-          st.dataframe(tabela_exibicao, use_container_width=True, hide_index=True)
-
-        with col_ex_v2:
-          st.write("🗑️ **Apagar Venda**")
-          venda_selecionada = st.selectbox(
-              "Selecione a venda", list(vendas_dict.keys())
-          )
-          if st.button("Excluir Venda Selecionada", type="primary"):
-            id_venda_del = vendas_dict[venda_selecionada]
-            try:
-              client = get_turso_client()
-              client.execute("DELETE FROM vendas WHERE id = ?", [id_venda_del])
-              client.close()
-              st.success("Venda excluída com sucesso!")
-              st.rerun()
-            except Exception as e:
-              st.error(f"Erro ao excluir venda: {e}")
-
-      else:
-        st.info(
-            "Nenhuma venda registrada ainda. Use o formulário acima para registrar a primeira venda!"
-        )
-
-  except Exception as e:
-    st.error(f"Erro ao carregar o financeiro: {e}")
+        confirmar_venda = st.checkbox("Confirmo a exclusão desta venda", key=f"confirma_venda_{venda_id}")
+        if st.button("Excluir Venda Selecionada", type="primary", disabled=not confirmar_venda):
+          apagar("DELETE FROM vendas WHERE id = ?", venda_id, "Venda excluída.")
+    else:
+      st.info("Nenhuma venda registrada ainda.")
+  except Exception as exc:
+    st.error(f"Erro ao carregar o financeiro: {exc}")
