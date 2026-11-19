@@ -71,6 +71,16 @@ def migrar_banco(client):
       """CREATE TABLE IF NOT EXISTS kombito_migracoes (
           versao INTEGER PRIMARY KEY
       )""",
+      """CREATE TABLE IF NOT EXISTS rendimentos_insumos (
+          insumo_id INTEGER PRIMARY KEY,
+          peso_cru_g REAL NOT NULL CHECK (peso_cru_g > 0),
+          peso_pronto_g REAL NOT NULL CHECK (peso_pronto_g > 0)
+      )""",
+      """CREATE TRIGGER IF NOT EXISTS kombito_excluir_rendimento
+          AFTER DELETE ON insumos
+          BEGIN
+            DELETE FROM rendimentos_insumos WHERE insumo_id = OLD.id;
+          END""",
   ])
   if client.execute("SELECT 1 FROM kombito_migracoes WHERE versao = 1").rows:
     return
@@ -244,9 +254,52 @@ with aba1:
       )
       st.dataframe(df_insumos, width="stretch", hide_index=True)
 
-      st.write("---")
-      st.subheader("🗑️ Excluir Insumo")
+      st.divider()
       nomes_insumos = {r[0]: f"{r[1]} (ID {r[0]})" for r in rs.rows}
+      insumos_por_peso = {
+          r[0]: nomes_insumos[r[0]] for r in rs.rows
+          if UNIDADES.get(r[2].strip().lower(), (None, 1))[0] == "massa"
+      }
+      if insumos_por_peso:
+        st.subheader("Rendimento no preparo")
+        rendimento_id = st.selectbox(
+            "Insumo para cadastrar o rendimento", list(insumos_por_peso),
+            format_func=insumos_por_peso.__getitem__,
+        )
+        rendimento_salvo = executar(
+            "SELECT peso_cru_g, peso_pronto_g FROM rendimentos_insumos WHERE insumo_id = ?",
+            [rendimento_id],
+        ).rows
+        peso_cru_salvo, peso_pronto_salvo = rendimento_salvo[0] if rendimento_salvo else (None, None)
+        with st.form(f"rendimento_{rendimento_id}"):
+          col_cru, col_pronto = st.columns(2)
+          peso_cru = col_cru.number_input(
+              "Peso cru (g)", min_value=0.001, value=peso_cru_salvo,
+              step=1.0, format="%.3f", placeholder="Ex.: 550",
+          )
+          peso_pronto = col_pronto.number_input(
+              "Peso após o preparo (g)", min_value=0.001, value=peso_pronto_salvo,
+              step=1.0, format="%.3f", placeholder="Ex.: 1500",
+          )
+          if st.form_submit_button("Salvar rendimento"):
+            if not all(peso is not None and math.isfinite(peso) and peso > 0
+                       for peso in (peso_cru, peso_pronto)):
+              st.warning("Informe os dois pesos em gramas, ambos maiores que zero.")
+            else:
+              resultado = executar(
+                  """INSERT INTO rendimentos_insumos (insumo_id, peso_cru_g, peso_pronto_g)
+                     SELECT id, ?, ? FROM insumos WHERE id = ?
+                     ON CONFLICT(insumo_id) DO UPDATE SET
+                       peso_cru_g = excluded.peso_cru_g, peso_pronto_g = excluded.peso_pronto_g""",
+                  [peso_cru, peso_pronto, rendimento_id],
+              )
+              if resultado.rows_affected == 1:
+                st.session_state["mensagem_sucesso"] = "Rendimento salvo."
+                st.rerun()
+              st.warning("Este insumo já foi excluído. Atualize a página.")
+
+      st.divider()
+      st.subheader("🗑️ Excluir Insumo")
       insumo_para_excluir = st.selectbox(
           "Selecione o insumo para apagar", list(nomes_insumos),
           format_func=nomes_insumos.__getitem__, key="insumo_excluir",
@@ -320,7 +373,21 @@ with aba2:
         )
         unidade_compra = insumos[insumo_id][2].strip().lower()
         grupo, fator_compra = UNIDADES.get(unidade_compra, (unidade_compra, 1))
-        opcoes = list(UNIDADES)
+        rendimento = executar(
+            "SELECT peso_cru_g, peso_pronto_g FROM rendimentos_insumos WHERE insumo_id = ?",
+            [insumo_id],
+        ).rows
+        usar_rendimento = bool(rendimento) and st.checkbox(
+            "A quantidade usada é do insumo já preparado",
+            key=f"usar_rendimento_{insumo_id}",
+        )
+        if usar_rendimento:
+          peso_cru_g, peso_pronto_g = rendimento[0]
+          st.caption(f"Rendimento cadastrado: {peso_cru_g:g} g crus → {peso_pronto_g:g} g prontos.")
+        opcoes = [
+            unidade for unidade, (tipo, _) in UNIDADES.items()
+            if not usar_rendimento or tipo == "massa"
+        ]
         if unidade_compra not in UNIDADES:
           opcoes.append(unidade_compra)
         padrao = {"massa": "g", "volume": "ml", "contagem": "un"}.get(grupo, unidade_compra)
@@ -328,18 +395,21 @@ with aba2:
         col_qtd, col_unidade = st.columns(2)
         with col_qtd:
           quantidade = st.number_input(
-              "Quantidade usada na marmita", min_value=0.001, value=1.0,
+              "Quantidade pronta usada na marmita" if usar_rendimento else "Quantidade usada na marmita",
+              min_value=0.001, value=1.0,
               step=0.001, format="%.3f",
           )
         with col_unidade:
           unidade_uso = st.selectbox(
               "Unidade de medida que você usou", opcoes, index=opcoes.index(padrao),
               format_func=lambda unidade: {"un": "unidade (un)", "litro": "litro (L)"}.get(unidade, unidade),
-              key=f"receita_unidade_{insumo_id}",
+              key=f"receita_unidade_{insumo_id}" if not usar_rendimento else f"receita_unidade_pronta_{insumo_id}",
           )
         grupo_uso, fator_uso = UNIDADES.get(unidade_uso, (unidade_uso, 1))
         if grupo_uso == grupo:
           fator_conversao = fator_uso / fator_compra
+          if usar_rendimento:
+            fator_conversao *= peso_cru_g / peso_pronto_g
         else:
           fator_conversao = st.number_input(
               f"Equivalência em {unidade_compra} para 1 {unidade_uso}",
