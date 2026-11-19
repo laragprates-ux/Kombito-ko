@@ -320,14 +320,10 @@ with aba2:
         )
         unidade_compra = insumos[insumo_id][2].strip().lower()
         grupo, fator_compra = UNIDADES.get(unidade_compra, (unidade_compra, 1))
-        opcoes = [unidade for unidade, (tipo, _) in UNIDADES.items() if tipo == grupo]
-        if not opcoes:
-          opcoes = [unidade_compra]
-        elif grupo in ("massa", "volume"):
-          # Começa pela unidade menor que já era usada como padrão na receita.
-          padrao = {"massa": "g", "volume": "ml"}[grupo]
-          opcoes.remove(padrao)
-          opcoes.insert(0, padrao)
+        opcoes = list(UNIDADES)
+        if unidade_compra not in UNIDADES:
+          opcoes.append(unidade_compra)
+        padrao = {"massa": "g", "volume": "ml", "contagem": "un"}.get(grupo, unidade_compra)
 
         col_qtd, col_unidade = st.columns(2)
         with col_qtd:
@@ -337,13 +333,24 @@ with aba2:
           )
         with col_unidade:
           unidade_uso = st.selectbox(
-              "Unidade de medida que você usou", opcoes, key=f"receita_unidade_{grupo}",
+              "Unidade de medida que você usou", opcoes, index=opcoes.index(padrao),
+              format_func=lambda unidade: {"un": "unidade (un)", "litro": "litro (L)"}.get(unidade, unidade),
+              key=f"receita_unidade_{insumo_id}",
+          )
+        grupo_uso, fator_uso = UNIDADES.get(unidade_uso, (unidade_uso, 1))
+        if grupo_uso == grupo:
+          fator_conversao = fator_uso / fator_compra
+        else:
+          fator_conversao = st.number_input(
+              f"Equivalência em {unidade_compra} para 1 {unidade_uso}",
+              min_value=0.0, value=None, step=0.001, format="%.6f",
+              help="Informe quanto uma unidade da receita pesa, mede ou rende na unidade de compra deste insumo.",
+              key=f"receita_equivalencia_{insumo_id}_{unidade_uso}",
           )
         if st.button("Adicionar à Receita", type="primary"):
-          _, fator_uso = UNIDADES.get(unidade_uso, (grupo, 1))
-          quantidade_base = quantidade * (fator_uso / fator_compra)
-          if not math.isfinite(quantidade_base) or quantidade_base <= 0:
-            st.warning("Informe uma quantidade positiva e válida.")
+          quantidade_base = quantidade * fator_conversao if fator_conversao is not None else None
+          if quantidade_base is None or not math.isfinite(quantidade_base) or quantidade_base <= 0:
+            st.warning("Informe uma quantidade positiva e, quando necessário, uma equivalência válida.")
           else:
             executar(
                 "INSERT INTO ficha_tecnica (marmita_id, insumo_id, quantidade) VALUES (?, ?, ?)",
