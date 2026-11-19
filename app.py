@@ -51,6 +51,14 @@ def executar(sql, parametros=()):
     return client.execute(sql, parametros)
 
 
+def embalagem_valida(quantidade, preco):
+  return (
+      quantidade is not None and math.isfinite(quantidade) and quantidade > 0
+      and preco is not None and math.isfinite(preco) and preco >= 0
+      and math.isfinite(preco / quantidade)
+  )
+
+
 def migrar_banco(client):
   client.batch([
       """CREATE TABLE IF NOT EXISTS insumos (
@@ -273,9 +281,7 @@ with aba1:
     if enviado_insumo:
       if nome_insumo.strip() == "":
         st.warning("Por favor, digite o nome do insumo.")
-      elif not (math.isfinite(qtde_embalagem) and qtde_embalagem > 0
-                and math.isfinite(preco_total) and preco_total >= 0
-                and math.isfinite(preco_total / qtde_embalagem)):
+      elif not embalagem_valida(qtde_embalagem, preco_total):
         st.warning("Informe uma quantidade positiva e um preço válido.")
       else:
         try:
@@ -320,6 +326,39 @@ with aba1:
 
       st.divider()
       nomes_insumos = {r[0]: f"{r[1]} (ID {r[0]})" for r in rs.rows}
+      insumos_por_id = {r[0]: r for r in rs.rows}
+      with st.expander("Atualizar preço"):
+        insumo_preco_id = st.selectbox(
+            "Insumo para atualizar o preço", list(nomes_insumos),
+            format_func=nomes_insumos.__getitem__,
+        )
+        _, _, unidade_preco, tamanho_atual, preco_atual, custo_atual = insumos_por_id[insumo_preco_id]
+        st.caption(f"Custo atual de R$ {custo_atual:.4f} por {unidade_preco}.")
+        with st.form(f"atualizar_preco_{insumo_preco_id}_{tamanho_atual}_{preco_atual}"):
+          col_tamanho, col_preco = st.columns(2)
+          novo_tamanho = col_tamanho.number_input(
+              f"Tamanho da embalagem ({unidade_preco})",
+              min_value=0.0, value=float(tamanho_atual), step=0.1, format="%.3f",
+          )
+          novo_preco = col_preco.number_input(
+              "Valor pago pela embalagem (R$)",
+              min_value=0.0, value=float(preco_atual), step=0.01, format="%.2f",
+          )
+          if st.form_submit_button("Salvar novo preço"):
+            if not embalagem_valida(novo_tamanho, novo_preco):
+              st.warning("Informe um tamanho de embalagem maior que zero e um preço válido.")
+            else:
+              resultado = executar(
+                  """UPDATE insumos
+                     SET quantidade_embalagem = ?, preco_total = ?, preco_unitario = ?
+                     WHERE id = ?""",
+                  [novo_tamanho, novo_preco, novo_preco / novo_tamanho, insumo_preco_id],
+              )
+              if resultado.rows_affected == 1:
+                st.session_state["mensagem_sucesso"] = "Preço do insumo atualizado."
+                st.rerun()
+              st.warning("Este insumo já foi excluído. Atualize a página.")
+
       unidades_preparo = {
           r[0]: UNIDADES_PREPARO[grupo]
           for r in rs.rows
