@@ -35,6 +35,8 @@ UNIDADES = {
     "meia dúzia": ("contagem", 6),
 }
 
+UNIDADES_PREPARO = {"massa": "g", "volume": "ml", "contagem": "un"}
+
 CONSULTA_CUSTOS = """
     SELECT f.marmita_id, SUM(f.quantidade * i.preco_unitario) AS custo
     FROM ficha_tecnica AS f
@@ -139,17 +141,79 @@ def migrar_banco(client):
   ])
 
 
+def migrar_rendimentos(client):
+  # Os nomes legados do cadastro são mantidos para compatibilidade.
+  # Os valores usam a unidade de preparo de cada insumo: g, ml ou un.
+  if client.execute("SELECT 1 FROM kombito_migracoes WHERE versao = 2").rows:
+    return
+
+  client.batch([
+      "ALTER TABLE ficha_tecnica ADD COLUMN quantidade_pronta REAL",
+      "ALTER TABLE ficha_tecnica ADD COLUMN fator_compra REAL",
+      *[
+          f"""CREATE TRIGGER kombito_recalcular_rendimento_{evento.lower()}
+              AFTER {evento} ON rendimentos_insumos
+              BEGIN
+                UPDATE ficha_tecnica
+                SET quantidade = quantidade_pronta * (NEW.peso_cru_g / NEW.peso_pronto_g) / fator_compra
+                WHERE insumo_id = NEW.insumo_id AND quantidade_pronta IS NOT NULL;
+              END"""
+          for evento in ("INSERT", "UPDATE")
+      ],
+      "INSERT INTO kombito_migracoes (versao) VALUES (2)",
+  ])
+
+
 @st.cache_resource
 def inicializar_banco(url, _token):
   with libsql_client.create_client_sync(url=url, auth_token=_token) as client:
-    try:
-      migrar_banco(client)
-    except libsql_client.LibsqlError:
-      # Outra sessão pode ter concluído a migração enquanto esta lia o esquema.
-      if not client.execute("SELECT 1 FROM kombito_migracoes WHERE versao = 1").rows:
-        raise
-      logging.info("Migração do Kombito concluída por outra sessão.")
+    for versao, migracao in ((1, migrar_banco), (2, migrar_rendimentos)):
+      try:
+        migracao(client)
+      except libsql_client.LibsqlError:
+        # Outra sessão pode ter concluído a migração enquanto esta lia o esquema.
+        if not client.execute("SELECT 1 FROM kombito_migracoes WHERE versao = ?", [versao]).rows:
+          raise
+        logging.info("Migração %s do Kombito concluída por outra sessão.", versao)
   return True
+
+
+def consultar_ficha(marmita_id):
+  return executar(
+      """SELECT f.id, COALESCE(i.nome, 'Insumo removido #' || f.insumo_id),
+                f.quantidade, i.unidade, f.quantidade_pronta, f.fator_compra,
+                f.quantidade * i.preco_unitario, f.insumo_id, r.insumo_id IS NOT NULL
+         FROM ficha_tecnica AS f
+         LEFT JOIN insumos AS i ON i.id = f.insumo_id
+         LEFT JOIN rendimentos_insumos AS r ON r.insumo_id = f.insumo_id
+         WHERE f.marmita_id = ? ORDER BY f.id""",
+      [marmita_id],
+  ).rows
+
+
+def tabela_ficha(ficha):
+  tabela = []
+  for id_item, nome, quantidade, unidade, pronta, fator_compra, custo, _, ativo in ficha:
+    grupo = UNIDADES.get((unidade or "").strip().lower(), (None, 1))[0]
+    antes = quantidade * fator_compra if pronta is not None else None
+    tabela.append({
+        "ID": id_item,
+        "Insumo": nome,
+        "Qtd. na unidade de compra": quantidade,
+        "Unidade de compra": unidade,
+        "Antes do preparo": antes,
+        "Após o preparo": pronta,
+        "Unidade de preparo": UNIDADES_PREPARO.get(grupo) if antes is not None else None,
+        "Rendimento (%)": 100 * pronta / antes if antes else None,
+        "Variação (%)": 100 * (pronta / antes - 1) if antes else None,
+        "Diferença (pronto − cru)": pronta - antes if antes is not None else None,
+        "Vínculo": ("Ativo" if ativo else "Último rendimento aplicado") if antes is not None else None,
+        "Custo (R$)": custo,
+    })
+  return pd.DataFrame(tabela).round({
+      "Qtd. na unidade de compra": 6, "Antes do preparo": 3, "Após o preparo": 3,
+      "Rendimento (%)": 2, "Variação (%)": 2, "Diferença (pronto − cru)": 3, "Custo (R$)": 2,
+  })
 
 
 def apagar(sql, registro_id, sucesso):
@@ -256,47 +320,74 @@ with aba1:
 
       st.divider()
       nomes_insumos = {r[0]: f"{r[1]} (ID {r[0]})" for r in rs.rows}
-      insumos_por_peso = {
-          r[0]: nomes_insumos[r[0]] for r in rs.rows
-          if UNIDADES.get(r[2].strip().lower(), (None, 1))[0] == "massa"
+      unidades_preparo = {
+          r[0]: UNIDADES_PREPARO[grupo]
+          for r in rs.rows
+          if (grupo := UNIDADES.get(r[2].strip().lower(), (None, 1))[0]) in UNIDADES_PREPARO
       }
-      if insumos_por_peso:
+      if unidades_preparo:
         st.subheader("Rendimento no preparo")
         rendimento_id = st.selectbox(
-            "Insumo para cadastrar o rendimento", list(insumos_por_peso),
-            format_func=insumos_por_peso.__getitem__,
+            "Insumo para cadastrar o rendimento", list(unidades_preparo),
+            format_func=nomes_insumos.__getitem__,
         )
+        unidade_preparo = unidades_preparo[rendimento_id]
         rendimento_salvo = executar(
             "SELECT peso_cru_g, peso_pronto_g FROM rendimentos_insumos WHERE insumo_id = ?",
             [rendimento_id],
         ).rows
-        peso_cru_salvo, peso_pronto_salvo = rendimento_salvo[0] if rendimento_salvo else (None, None)
-        with st.form(f"rendimento_{rendimento_id}"):
-          col_cru, col_pronto = st.columns(2)
-          peso_cru = col_cru.number_input(
-              "Peso cru (g)", min_value=0.001, value=peso_cru_salvo,
-              step=1.0, format="%.3f", placeholder="Ex.: 550",
+        antes_salvo, depois_salvo = rendimento_salvo[0] if rendimento_salvo else (None, None)
+        if rendimento_salvo:
+          percentual = 100 * depois_salvo / antes_salvo
+          st.caption(
+              f"Rendimento atual de {percentual:.2f}% · "
+              f"Variação de {percentual - 100:+.2f}% "
+              f"({depois_salvo - antes_salvo:+g} {unidade_preparo})"
           )
-          peso_pronto = col_pronto.number_input(
-              "Peso após o preparo (g)", min_value=0.001, value=peso_pronto_salvo,
-              step=1.0, format="%.3f", placeholder="Ex.: 1500",
+        with st.form(f"rendimento_{rendimento_id}_{antes_salvo}_{depois_salvo}"):
+          col_antes, col_depois = st.columns(2)
+          antes = col_antes.number_input(
+              f"Quantidade antes do preparo ({unidade_preparo})",
+              min_value=0.001, value=antes_salvo, step=1.0, format="%.3f",
           )
+          depois = col_depois.number_input(
+              f"Quantidade após o preparo ({unidade_preparo})",
+              min_value=0.001, value=depois_salvo, step=1.0, format="%.3f",
+          )
+          confirmar_atipico = st.checkbox("Confirmei as medidas de um rendimento atípico")
           if st.form_submit_button("Salvar rendimento"):
-            if not all(peso is not None and math.isfinite(peso) and peso > 0
-                       for peso in (peso_cru, peso_pronto)):
-              st.warning("Informe os dois pesos em gramas, ambos maiores que zero.")
+            if not all(qtd is not None and math.isfinite(qtd) and qtd > 0 for qtd in (antes, depois)):
+              st.warning("Informe duas quantidades positivas e válidas.")
+            elif not math.isfinite(100 * (depois / antes)) or not math.isfinite(100 * (antes / depois)):
+              st.warning("A proporção entre as quantidades é grande demais para o cálculo.")
+            elif not 0.25 <= depois / antes <= 4 and not confirmar_atipico:
+              st.warning(
+                  f"O rendimento é de {100 * (depois / antes):.2f}%. Confira as medidas em "
+                  f"{unidade_preparo} e confirme se esse resultado corresponde ao preparo."
+              )
             else:
               resultado = executar(
                   """INSERT INTO rendimentos_insumos (insumo_id, peso_cru_g, peso_pronto_g)
                      SELECT id, ?, ? FROM insumos WHERE id = ?
                      ON CONFLICT(insumo_id) DO UPDATE SET
-                       peso_cru_g = excluded.peso_cru_g, peso_pronto_g = excluded.peso_pronto_g""",
-                  [peso_cru, peso_pronto, rendimento_id],
+                       peso_cru_g = excluded.peso_cru_g,
+                       peso_pronto_g = excluded.peso_pronto_g""",
+                  [antes, depois, rendimento_id],
               )
               if resultado.rows_affected == 1:
                 st.session_state["mensagem_sucesso"] = "Rendimento salvo."
                 st.rerun()
               st.warning("Este insumo já foi excluído. Atualize a página.")
+        if rendimento_salvo:
+          confirmar_remocao = st.checkbox(
+              "Confirmo a remoção do rendimento cadastrado", key=f"remover_rendimento_{rendimento_id}",
+              help="As fichas mantêm a última conversão aplicada até que um novo rendimento seja cadastrado.",
+          )
+          if st.button("Remover rendimento", disabled=not confirmar_remocao):
+            apagar(
+                "DELETE FROM rendimentos_insumos WHERE insumo_id = ?", rendimento_id,
+                "Rendimento removido.",
+            )
 
       st.divider()
       st.subheader("🗑️ Excluir Insumo")
@@ -382,11 +473,12 @@ with aba2:
             key=f"usar_rendimento_{insumo_id}",
         )
         if usar_rendimento:
-          peso_cru_g, peso_pronto_g = rendimento[0]
-          st.caption(f"Rendimento cadastrado: {peso_cru_g:g} g crus → {peso_pronto_g:g} g prontos.")
+          antes, depois = rendimento[0]
+          medida = UNIDADES_PREPARO[grupo]
+          st.caption(f"Rendimento cadastrado de {antes:g} {medida} antes para {depois:g} {medida} após o preparo.")
         opcoes = [
             unidade for unidade, (tipo, _) in UNIDADES.items()
-            if not usar_rendimento or tipo == "massa"
+            if not usar_rendimento or tipo == grupo
         ]
         if unidade_compra not in UNIDADES:
           opcoes.append(unidade_compra)
@@ -408,8 +500,6 @@ with aba2:
         grupo_uso, fator_uso = UNIDADES.get(unidade_uso, (unidade_uso, 1))
         if grupo_uso == grupo:
           fator_conversao = fator_uso / fator_compra
-          if usar_rendimento:
-            fator_conversao *= peso_cru_g / peso_pronto_g
         else:
           fator_conversao = st.number_input(
               f"Equivalência em {unidade_compra} para 1 {unidade_uso}",
@@ -419,8 +509,24 @@ with aba2:
           )
         if st.button("Adicionar à Receita", type="primary"):
           quantidade_base = quantidade * fator_conversao if fator_conversao is not None else None
+          quantidade_pronta = quantidade * fator_uso
           if quantidade_base is None or not math.isfinite(quantidade_base) or quantidade_base <= 0:
             st.warning("Informe uma quantidade positiva e, quando necessário, uma equivalência válida.")
+          elif usar_rendimento:
+            if not math.isfinite(quantidade_pronta):
+              st.warning("Informe uma quantidade pronta válida.")
+            else:
+              resultado = executar(
+                  """INSERT INTO ficha_tecnica
+                        (marmita_id, insumo_id, quantidade, quantidade_pronta, fator_compra)
+                     SELECT ?, insumo_id, ? * (peso_cru_g / peso_pronto_g), ?, ?
+                     FROM rendimentos_insumos WHERE insumo_id = ?""",
+                  [marmita_id, quantidade_base, quantidade_pronta, fator_compra, insumo_id],
+              )
+              if resultado.rows_affected == 1:
+                st.session_state["mensagem_sucesso"] = "Ingrediente adicionado à receita."
+                st.rerun()
+              st.warning("O rendimento foi removido. Atualize a página.")
           else:
             executar(
                 "INSERT INTO ficha_tecnica (marmita_id, insumo_id, quantidade) VALUES (?, ?, ?)",
@@ -429,19 +535,39 @@ with aba2:
             st.session_state["mensagem_sucesso"] = "Ingrediente adicionado à receita."
             st.rerun()
 
-      ficha = executar(
-          """SELECT f.id, COALESCE(i.nome, 'Insumo removido #' || f.insumo_id),
-                    f.quantidade, i.unidade
-             FROM ficha_tecnica AS f LEFT JOIN insumos AS i ON i.id = f.insumo_id
-             WHERE f.marmita_id = ? ORDER BY f.id""",
-          [marmita_id],
-      ).rows
+      ficha = consultar_ficha(marmita_id)
       st.subheader("Ficha técnica")
       if ficha:
-        st.dataframe(pd.DataFrame(
-            [tuple(r) for r in ficha], columns=["ID", "Insumo", "Quantidade na unidade de compra", "Unidade"],
-        ), hide_index=True, width="stretch")
+        st.dataframe(tabela_ficha(ficha), hide_index=True, width="stretch")
         itens = {r[0]: f"{r[1]} (item {r[0]})" for r in ficha}
+        vinculaveis = {r[0]: r[3] for r in ficha if r[4] is None and r[8]}
+        if vinculaveis:
+          with st.expander("Vincular rendimento a um ingrediente existente"):
+            item_vinculo = st.selectbox(
+                "Ingrediente da ficha técnica", list(vinculaveis), format_func=itens.__getitem__,
+            )
+            grupo_item, fator_item = UNIDADES[vinculaveis[item_vinculo].strip().lower()]
+            with st.form(f"vincular_rendimento_{item_vinculo}"):
+              pronta = st.number_input(
+                  f"Quantidade pronta usada na marmita ({UNIDADES_PREPARO[grupo_item]})",
+                  min_value=0.001, value=None, step=1.0, format="%.3f",
+              )
+              if st.form_submit_button("Vincular e recalcular custo"):
+                if pronta is None or not math.isfinite(pronta) or pronta <= 0:
+                  st.warning("Informe a quantidade pronta efetivamente usada na marmita.")
+                else:
+                  resultado = executar(
+                      """UPDATE ficha_tecnica AS f
+                         SET quantidade = ? * (r.peso_cru_g / r.peso_pronto_g) / ?,
+                             quantidade_pronta = ?, fator_compra = ?
+                         FROM rendimentos_insumos AS r
+                         WHERE f.id = ? AND f.quantidade_pronta IS NULL AND f.insumo_id = r.insumo_id""",
+                      [pronta, fator_item, pronta, fator_item, item_vinculo],
+                  )
+                  if resultado.rows_affected == 1:
+                    st.session_state["mensagem_sucesso"] = "Rendimento vinculado e custo recalculado."
+                    st.rerun()
+                  st.warning("O ingrediente ou o rendimento mudou. Atualize a página.")
         item_id = st.selectbox("Ingrediente a remover", list(itens), format_func=itens.__getitem__)
         confirmar_item = st.checkbox("Confirmo a remoção deste ingrediente", key=f"confirma_item_{item_id}")
         if st.button("Remover ingrediente", disabled=not confirmar_item):
@@ -482,6 +608,14 @@ with aba3:
       tabela["Lucro Estimado (R$)"] = custo * acrescimo / 100
       st.subheader("📊 Custos e Sugestão de Preços")
       st.dataframe(tabela.round(2), width="stretch", hide_index=True)
+      with st.expander("Detalhamento do custo e do rendimento por ingrediente"):
+        marmitas_custo = {r[0]: f"{r[1]} (ID {r[0]})" for r in custos}
+        marmita_custo_id = st.selectbox(
+            "Marmita para detalhar", list(marmitas_custo), format_func=marmitas_custo.__getitem__,
+        )
+        ficha_custo = consultar_ficha(marmita_custo_id)
+        if ficha_custo:
+          st.dataframe(tabela_ficha(ficha_custo), width="stretch", hide_index=True)
     else:
       st.info("Cadastre marmitas e insumos nas fichas técnicas para ver os custos.")
   except Exception as exc:
